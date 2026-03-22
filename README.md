@@ -1,263 +1,244 @@
-# PrameyaEngine
+# Video Tampering Detector
 
-PrameyaEngine is a Python-based forensic framework for **image and video authentication** built around the **Six Pillars of Detection**. It produces a single, normalized output per analyzed frame (or per aggregated video run):
+A forensic video analysis tool that detects tampering, splicing, and frame manipulation using **Temporal Differencing**, **Frame Drop Detection**, and **Static Noise Analysis** — with a composite tampering score and visual heatmap output.
 
-- **Probability of Tampering**: a float in **[0, 1]** computed as a weighted average of the six pillar scores.
+---
 
-**Images** are analyzed directly via `PrameyaEngine(image_path)`. **Videos** are supported by **sampling frames** (for example with OpenCV `VideoCapture`), writing each frame to a temporary image file or path the engine can read, and then **aggregating** frame-level scores (mean, maximum, or fraction above a threshold) for a clip-level verdict.
+##  Table of Contents
 
-This repository contains a working implementation of all six pillars on **raster frames** (the same logic applies whether the source is a still photo or a decoded video frame):
+- [Features](#-features)
+- [How It Works](#-how-it-works)
+- [Tampering Score](#-tampering-score)
+- [Requirements](#-requirements)
+- [Installation](#-installation)
+- [Usage](#-usage)
+- [Output Files](#-output-files)
+- [CLI Arguments](#-cli-arguments)
+- [Project Structure](#-project-structure)
+- [Roadmap](#-roadmap)
 
-- **ELA**: Error Level Analysis (Pillow-based recompression + difference variance)
-- **DQ**: Double Quantization (8×8 DCT with `scipy.fftpack` and AC histogram “holes”)
-- **PRNU**: Sensor fingerprinting heuristic (noise residual via OpenCV NLM denoise + abnormality scoring)
-- **CFA**: Bayer-grid artifact heuristic (Laplacian local variance + cross-channel disagreement)
-- **SVD**: Copy-move detection (overlapping blocks + SVD singular vectors + lexicographic sorting)
-- **Metadata & Hex Audit**: EXIF + raw bytes scan for editor footprints and missing camera tags (most meaningful on **exported frame files** such as JPEG/PNG; container-level metadata is not read by the engine)
+---
 
-> Note: This is a **forensic heuristic framework**. Scores depend on image type, compression, and content; calibrate against your dataset. For video, temporal consistency (frame-to-frame jumps) is not a separate pillar—combine frame scores with your own temporal rules if needed.
+## Features
 
-## Installation
+-  **Frame Drop Detection** — Catches missing/cut frames via timestamp gap analysis
+-  **Static Noise Analysis** — Detects frozen/pasted-over regions using pixel std deviation
+-  **Temporal Differencing** — Flags sudden pixel-level anomalies (3σ spike detection)
+-  **Composite Tampering Score** — Weighted 0–100% score with risk tier classification
+-  **Heatmap Generation** — JET colormap overlay showing *where* tampering occurred spatially
+- **Rich Terminal Output** — Color-coded report with visual progress bars and score meter
+- **Optional Diff Video** — Save frame-by-frame difference as `output_diff.mp4`
+
+---
+
+##  How It Works
+
+The detector runs three independent analysis signals on every frame:
+
+### Signal A — Frame Drop Detection (Weight: 35%)
+Compares the timestamp gap between consecutive frames against the expected frame duration (`1000ms / FPS`). If a gap exceeds **1.9×** the expected duration, frames are flagged as missing — a strong indicator of a cut or splice.
+
+### Signal B — Static Noise Analysis (Weight: 30%)
+Measures the standard deviation of pixel intensity inside a Region of Interest (ROI) per frame. A `std_dev < 1.0` means near-zero noise — indicating a **static image was pasted** over the video. High noise variance across frames also flags possible re-encoding or sensor switching.
+
+### Signal C — Temporal Diff Spikes (Weight: 35%)
+Computes `absdiff` between every consecutive frame pair. Frames more than **3 standard deviations above the mean** (3σ) are flagged as anomalous spikes — these mark the exact moments an edit, insert, or splice occurred.
+
+---
+
+##  Tampering Score
+
+The three signals are combined into a single weighted composite score:
+
+```
+Final Score = (Score_A × 0.35) + (Score_B × 0.30) + (Score_C × 0.35) × 100
+```
+
+| Score Range | Risk Level | Meaning |
+|:-----------:|:----------:|---------|
+| 0% – 9%     | ✅ CLEAN   | No significant tampering indicators |
+| 10% – 34%   | 🟡 LOW     | Minor anomalies, possibly compression artifacts |
+| 35% – 69%   | 🟠 MEDIUM  | Moderate signals — manual review recommended |
+| 70% – 100%  | 🔴 HIGH    | Strong tampering indicators — video likely manipulated |
+
+---
+
+##  Requirements
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| Python  | 3.8+    | Runtime |
+| opencv-python | ≥ 4.5 | Video I/O, frame processing, heatmap generation |
+| numpy   | ≥ 1.21  | Array math, statistical analysis |
+
+---
+
+##  Installation
+
+### Option 1 — Virtual Environment (Recommended)
 
 ```bash
-pip install -r requirements.txt
+# 1. Clone or download the project
+git clone https://github.com/your-username/video-tampering-detector.git
+cd video-tampering-detector
+
+# 2. Create a virtual environment
+python -m venv venv
+
+# 3. Activate the virtual environment
+# On Windows:
+venv\Scripts\activate
+
+# On macOS/Linux:
+source venv/bin/activate
+
+# 4. Install dependencies
+pip install opencv-python numpy
 ```
 
-## Quick start (images)
-
-```python
-from prameya_engine import PrameyaEngine
-
-engine = PrameyaEngine("path/to/image.jpg")
-
-prob_tampering = engine.generate_truth_score()
-print("Probability of Tampering:", prob_tampering)
-
-# You can also call pillars directly:
-print("ELA:", engine.detect_ela())
-print("DQ :", engine.detect_double_quantization())
-print("PRNU:", engine.detect_prnu())
-print("CFA :", engine.detect_cfa())
-print("SVD :", engine.detect_svd())
-print("META:", engine.audit_metadata())
-```
-
-## Video tampering (frame-based analysis)
-
-The engine operates on **single images**. For video, decode frames with OpenCV, save selected frames to disk (JPEG/PNG), run `PrameyaEngine` on each path, then aggregate.
-
-Example: sample every *n*-th frame and use the **mean** tampering probability across sampled frames (adjust stride and aggregation to match your latency and accuracy needs):
-
-```python
-import os
-import tempfile
-
-import cv2
-
-from prameya_engine import PrameyaEngine
-
-
-def analyze_video(video_path: str, frame_stride: int = 30) -> dict:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-
-    scores = []
-    frame_index = 0
-
-    with tempfile.TemporaryDirectory() as tmp:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if frame_index % frame_stride == 0:
-                frame_path = os.path.join(tmp, f"f_{frame_index:06d}.jpg")
-                cv2.imwrite(frame_path, frame)
-                engine = PrameyaEngine(frame_path)
-                scores.append(engine.generate_truth_score())
-            frame_index += 1
-
-    cap.release()
-
-    if not scores:
-        return {
-            "frames_decoded": frame_index,
-            "samples": 0,
-            "mean_probability": None,
-            "max_probability": None,
-        }
-
-    return {
-        "frames_decoded": frame_index,
-        "samples": len(scores),
-        "mean_probability": sum(scores) / len(scores),
-        "max_probability": max(scores),
-        "per_frame_scores": scores,
-    }
-
-
-# result = analyze_video("path/to/video.mp4", frame_stride=30)
-# print(result["mean_probability"], result["max_probability"])
-```
-
-**Practical notes for video:**
-
-- **Stride**: smaller stride = more frames = slower but smoother coverage; use keyframe-only steps for speed if edits are localized in time.
-- **Aggregation**: `max` is sensitive to a single bad frame; **mean** or **95th percentile** often behave better for long clips.
-- **ELA / DQ / metadata**: re-saving frames as JPEG in the snippet above introduces compression; for fair ELA/DQ on raw decode, consider lossless PNG intermediates or extend the engine to accept in-memory arrays (not in this repo today).
-- **Copy-move / splicing**: `detect_svd()` and CFA-style cues can flag duplicated or inconsistent regions **within a frame**; cross-frame deepfake detection would require additional temporal models beyond these pillars.
-
-### Visual tamper maps for video
-
-Call `generate_visual_report()` on **individual frames** of interest (e.g., frames where `generate_truth_score()` exceeds a threshold) to produce ELA heatmaps and SVD maps under `results/`, same as for still images.
-
-## Visual tamper maps for dashboards (images / per frame)
-
-`PrameyaEngine` can generate **localized tamper maps** suitable for UI overlays and save them as PNG files in a `results` folder:
-
-```python
-from prameya_engine import PrameyaEngine
-
-engine = PrameyaEngine("path/to/image.jpg")
-
-report = engine.generate_visual_report(results_dir="results")
-
-print("ELA heatmap PNG:", report["ela_heatmap_path"])
-print("SVD tamper map PNG:", report["svd_tamper_map_path"])
-print("SVD matching blocks:", report["svd_matches"])  # List[(y1, x1, y2, x2)]
-```
-
-- **ELA pillar**: saves a **grayscale heatmap** PNG (`*_ELA_tamper_map.png`) where **brighter pixels indicate higher probability of tampering**.
-- **SVD (Copy-Move) pillar**:
-  - returns a list of matching block coordinate pairs: `(y1, x1, y2, x2)` in image pixel space;
-  - saves a **binary tamper map** PNG (`*_SVD_tamper_map.png`) where bright regions correspond to detected copy-move blocks.
-
-These PNGs and coordinates can be consumed directly by your dashboard to draw overlays or highlight suspicious regions.
-
-## File overview
-
-- `prameya_engine.py`: The full implementation (`PrameyaEngine`).
-- `test_bench.py`: CLI to run all six pillars on three image paths (`--original`, `--edited`, `--screenshot`) and print a short report.
-- `requirements.txt`: Runtime dependencies.
-
-## Public API (what to call)
-
-### Engine
-
-- `PrameyaEngine(image_path: str)`: loads the image via OpenCV (`cv2.imread`).
-
-### Pillar methods (each returns a score in **[0, 1]**)
-
-- `detect_ela()` → calls `run_ela()`
-- `detect_double_quantization()` → calls `run_double_quantization()`
-- `detect_prnu()` → calls `run_prnu()`
-- `detect_cfa()` → calls `run_cfa()`
-- `detect_svd()` → calls `run_svd_copy_move()`
-- `audit_metadata()` → calls `run_metadata_hex_audit()`
-
-### Aggregation (final score)
-
-#### `generate_truth_score(weights: dict[str, float] | None = None) -> float`
-
-Computes a **weighted average** of the six pillar scores.
-
-- **Expected weight keys**:
-  - `ela`
-  - `dq`
-  - `prnu`
-  - `cfa`
-  - `svd`
-  - `metadata`
-
-Example with custom weights:
-
-```python
-weights = {"ela": 1.0, "dq": 1.2, "prnu": 1.0, "cfa": 0.9, "svd": 1.4, "metadata": 0.8}
-print(engine.generate_truth_score(weights))
-```
-
-## Pillar details (what each one does)
-
-### 1) ELA (Error Level Analysis)
-
-- **Implementation**: `run_ela(quality=90, scale=15.0)`
-- **How it works**:
-  - Loads the image with Pillow, resaves it to JPEG at `quality=90` into memory
-  - Computes pixel-wise absolute difference between original and resaved
-  - Scales the difference image (brightness enhancement) so compression artifacts become visible
-  - Computes a **normalized tamper score** from the **variance** of the enhanced difference map
-
-### 2) DQ (Double Quantization)
-
-- **Implementation**: `run_double_quantization(block_size=8, bins=50)`
-- **How it works**:
-  - Converts to grayscale
-  - Splits into non-overlapping **8×8** blocks
-  - Computes **2D DCT** per block using `scipy.fftpack.dct` (row DCT then column DCT)
-  - Collects **AC coefficients** (all DCT terms except DC)
-  - Builds a histogram of AC magnitudes and estimates a score from periodic “holes” (zero-count bins)
-
-### 3) PRNU (Sensor fingerprinting)
-
-- **Implementation**: `run_prnu(h=10.0, template_window_size=7, search_window_size=21)`
-- **How it works** (no-reference heuristic):
-  - Uses `cv2.fastNlMeansDenoising` to estimate a “clean” version of the image
-  - Computes residual: `residual = original - denoised`
-  - Scores “abnormality” using:
-    - residual energy ratio (too low or too high can be suspicious)
-    - neighbor correlation in residual (structured residuals can be suspicious)
-
-### 4) CFA (Bayer grid artifacts)
-
-- **Implementation**: `run_cfa(ksize=3, blur_ksize=7)`
-- **How it works**:
-  - Computes Laplacian high-frequency response per color channel
-  - Measures local variance of Laplacian magnitude
-  - Computes a cross-channel disagreement map; higher disagreement increases the score
-
-### 5) SVD (Copy-move detection)
-
-- **Implementation**: `run_svd_copy_move(block_size=16, step=8, k=8, feature_decimals=3, min_shift=12)`
-- **How it works**:
-  - Extracts **overlapping blocks** (sliding window)
-  - Computes **SVD** per block; keeps the top `k` singular values
-  - Normalizes + rounds (quantizes) the singular vectors to stabilize matching
-  - Uses **lexicographical sorting** and compares neighbors in sorted order
-  - Matches with small spatial shift are ignored; repeated distant matches raise the score
-
-### 6) Metadata & Hex audit
-
-- **Implementation**: `run_metadata_hex_audit()`
-- **How it works**:
-  - Reads EXIF tags via `PIL.ExifTags` and searches values for editor footprints such as:
-    - Photoshop, GIMP, Canva (plus a few common editors)
-  - Scans raw file bytes (ASCII-ish + basic UTF-16LE decode) for the same footprints using regex
-  - Flags missing camera-ish tags that are often present in real camera photos:
-    - Make, Model, DateTimeOriginal, ExifVersion, ExposureTime, ISO, FNumber, FocalLength, etc.
-
-## Test bench (images)
-
-Compare three images from the command line:
+### Option 2 — Conda Environment
 
 ```bash
-python test_bench.py --original path/to/original.jpg --edited path/to/edited.jpg --screenshot path/to/screenshot.jpg
+# 1. Create and activate a conda environment
+conda create -n tampering-detector python=3.10
+conda activate tampering-detector
+
+# 2. Install dependencies
+pip install opencv-python numpy
 ```
 
-## Repro / sanity check script
+### Option 3 — System-wide (Quick)
 
-Create `check_engine.py` next to `prameya_engine.py`:
-
-```python
-from prameya_engine import PrameyaEngine
-
-img = "path/to/image.jpg"
-engine = PrameyaEngine(img)
-
-print("ELA     :", engine.detect_ela())
-print("DQ      :", engine.detect_double_quantization())
-print("PRNU    :", engine.detect_prnu())
-print("CFA     :", engine.detect_cfa())
-print("SVD     :", engine.detect_svd())
-print("Metadata:", engine.audit_metadata())
-print("TOTAL   :", engine.generate_truth_score())
+```bash
+pip install opencv-python numpy
 ```
+
+> ⚠️ **Note for Windows users:** If you see `ModuleNotFoundError: No module named 'cv2'`, make sure you have activated your virtual environment **before** running the script. Packages installed outside the venv are not accessible inside it.
+
+### Verify Installation
+
+```bash
+python -c "import cv2; import numpy; print('cv2:', cv2.__version__, '| numpy:', numpy.__version__)"
+```
+
+Expected output:
+```
+cv2: 4.x.x | numpy: 1.x.x
+```
+
+---
+
+##  Usage
+
+### Basic Usage
+
+```bash
+python tampering_detector.py --video your_video.mp4
+```
+
+### With All Options
+
+```bash
+python tampering_detector.py --video your_video.mp4 --save-diff --roi 300 350 400 450 --diff-threshold 25 --jump-threshold 1.9
+```
+
+### Examples
+
+```bash
+# Analyze a CCTV clip
+python tampering_detector.py --video cctv_footage.mp4
+
+# Analyze with a custom noise ROI (focus on road area)
+python tampering_detector.py --video road_cam.mp4 --roi 200 300 100 300
+
+# Save the temporal difference video too
+python tampering_detector.py --video clip.mp4 --save-diff
+
+# Lower the diff threshold for more sensitive detection
+python tampering_detector.py --video clip.mp4 --diff-threshold 15
+```
+
+---
+
+##  Output Files
+
+| File | Description |
+|------|-------------|
+| `output_heatmap.jpg` | JET colormap heatmap overlay — **Blue** = low change, **Red** = high change. Always generated. |
+| `output_diff.mp4` | Frame-by-frame temporal difference video. Generated only with `--save-diff`. |
+
+### Reading the Heatmap
+
+- **Blue regions** → low inter-frame change → normal/authentic
+- **Green/Yellow regions** → moderate change → could be motion or mild edit
+- **Red regions** → high accumulated change → likely location of tampering/splicing
+
+---
+
+##  CLI Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--video` | `str` | *(required)* | Path to the input video file |
+| `--save-diff` | flag | `False` | Save temporal diff video as `output_diff.mp4` |
+| `--roi` | `int int int int` | Center 100×100 | Noise analysis region: `Y1 Y2 X1 X2` |
+| `--diff-threshold` | `float` | `30` | Avg pixel diff value to flag a frame as high-change |
+| `--jump-threshold` | `float` | `1.9` | Timestamp gap multiplier to detect frame drops |
+
+### ROI (Region of Interest) Guide
+
+The `--roi` argument lets you focus the noise analysis on a specific part of the frame:
+
+```
+--roi Y1 Y2 X1 X2
+```
+
+Example — focus on top-left 200×200 area:
+```bash
+--roi 0 200 0 200
+```
+
+Example — focus on center of a 1080p video:
+```bash
+--roi 440 640 760 1160
+```
+
+---
+
+##  Project Structure
+
+```
+video-tampering-detector/
+│
+├── tampering_detector.py   # Main detection engine
+├── README.md               # This file
+│
+├── output_heatmap.jpg      # Generated after each run
+└── output_diff.mp4         # Generated with --save-diff
+```
+
+---
+
+## 🗺️ Roadmap
+
+- [x] Terminal-based detection engine
+- [x] Composite tampering score (0–100%)
+- [x] Heatmap generation
+- [x] Frame drop detection
+- [x] Static noise analysis
+- [x] 3σ temporal diff spike detection
+- [x] Tkinter GUI interface
+- [x] Per-second timeline chart of tampering intensity
+- [ ] PDF/JSON report export
+- [x] Batch processing multiple videos
+- [ ] Audio track discontinuity detection
+
+---
+
+##  License
+
+MIT License — free to use, modify, and distribute.
+
+---
+
+> Built with Python + OpenCV · Forensic Video Analysis Tool
